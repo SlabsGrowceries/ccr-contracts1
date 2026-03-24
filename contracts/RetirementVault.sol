@@ -17,6 +17,8 @@ contract RetirementVault is AccessControl {
 
     error InvalidAdmin();
     error InvalidRegistry();
+    /// Destination address for withdrawFees must be non-zero.
+    error InvalidRecipient();
     error InvalidNationCode();
     /// @param expected nationCode bound to the calling registry
     /// @param provided nationCode in the record submitted
@@ -32,6 +34,14 @@ contract RetirementVault is AccessControl {
     /// @param index  Requested index
     /// @param length Current ledger length
     error IndexOutOfRange(uint256 index, uint256 length);
+    /// Beneficiary address must be set — required for UNFCCC Art. 6.2 corresponding adjustments
+    error InvalidBeneficiary();
+    /// @param sent    msg.value supplied
+    /// @param required Minimum fee required per retirement record
+    error InsufficientRetirementFee(uint256 sent, uint256 required);
+    /// @param feeWei  Fee that was supplied
+    /// @param maximum Hard cap — MAX_RETIREMENT_FEE_WEI
+    error RetirementFeeTooHigh(uint256 feeWei, uint256 maximum);
 
     // ─────────────────────────────────────────────────────
     //  ROLES
@@ -39,6 +49,11 @@ contract RetirementVault is AccessControl {
 
     bytes32 public constant REGISTRY_ROLE = keccak256("REGISTRY_ROLE");
     bytes32 public constant ADMIN_ROLE    = keccak256("ADMIN_ROLE");
+
+    /// @notice Hard cap on per-retirement fee — prevents a compromised admin from
+    ///         bricking all retirements by setting an astronomically high fee.
+    ///         Analogous to CarbonPool's MAX_FEE_BPS hard cap.
+    uint256 public constant MAX_RETIREMENT_FEE_WEI = 1 ether;
 
     // ─────────────────────────────────────────────────────
     //  RETIREMENT RECORD
@@ -56,6 +71,11 @@ contract RetirementVault is AccessControl {
         uint16            vintageYear;
         uint64            retiredAt;
         bytes32           attestationHash;
+        /// @dev Final offsetting entity — may differ from retiringEntity under Art. 6.2 ITMOs.
+        ///      E.g. retiringEntity = Shell (the broker), beneficiaryAddress = Lufthansa (the airline).
+        ///      Required: UNFCCC Art. 6 corresponding-adjustment reporting and CORSIA MRV.
+        address           beneficiaryAddress;
+        string            beneficiaryName;
     }
 
     // ─────────────────────────────────────────────────────
@@ -80,6 +100,28 @@ contract RetirementVault is AccessControl {
     mapping(address           => uint256) public retiredByEntity;
     mapping(CompliancePurpose => uint256) public retiredByPurpose;
     mapping(uint16            => uint256) public retiredByVintage;
+    /// @notice Credits retired on behalf of each beneficiary — key for Art. 6.2 accounting.
+    mapping(address           => uint256) public retiredByBeneficiary;
+
+    // ─────────────────────────────────────────────────────
+    //  PLATFORM FEE
+    // ─────────────────────────────────────────────────────
+
+    /// @notice Fee in wei charged per retirement record. Zero = no fee (default).
+    ///         When non-zero, recordRetirement() is payable and requires msg.value >= this amount.
+    ///         Excess ETH above the fee is refunded to the caller.
+    ///         Set via setRetirementFee(); raise before activating for large-scale registries.
+    uint256 public retirementFeeWei;
+
+    /// @notice Address that receives accumulated platform fees.
+    ///         Zero = fee collection disabled even if retirementFeeWei > 0.
+    address public feeRecipient;
+
+    /// @notice Registries whose retirement records are permanently fee-exempt.
+    ///         Use for founding-partner waivers (e.g. Congo, Liberia during onboarding).
+    ///         Fee is still visible on-chain (retirementFeeWei > 0) — the waiver is
+    ///         a provable on-chain grant, not a silent discount.
+    mapping(address => bool) public feeWaived;
 
     // ─────────────────────────────────────────────────────
     //  EVENTS
@@ -87,11 +129,16 @@ contract RetirementVault is AccessControl {
 
     event RegistryAdded(address indexed registry, bytes2 indexed nationCode);
     event RegistryRemoved(address indexed registry);
+    event RetirementFeeUpdated(uint256 oldFee, uint256 newWei);
+    event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
+    event FeesWithdrawn(address indexed to, uint256 amount);
+    event FeeWaiverUpdated(address indexed registry, bool waived);
 
     event CreditRetiredGlobal(
         uint256 indexed tokenId,
         bytes2  indexed nationCode,
         address indexed retiringEntity,
+        address         beneficiaryAddress,
         string  purpose,
         string  complianceRef,
         uint64  retiredAt
@@ -136,11 +183,16 @@ contract RetirementVault is AccessControl {
 
     /// @notice Record a retirement permanently. Called by an authorized national registry.
     ///         This record is immutable — it can never be deleted or modified.
+    ///         When retirementFeeWei > 0 and feeRecipient is set, msg.value must cover
+    ///         the fee. Any ETH above the fee is refunded to the caller.
+    ///         Fee starts at zero — existing SovereignRegistry integration requires no changes
+    ///         until the fee is activated by governance.
     /// @param  record Fully populated RetirementRecord to append to the ledger.
     /// @return ledgerIndex Zero-based index of the new record in the ledger array.
     function recordRetirement(
         RetirementRecord calldata record
-    ) external onlyRole(REGISTRY_ROLE) returns (uint256 ledgerIndex) {
+    ) external payable onlyRole(REGISTRY_ROLE) returns (uint256 ledgerIndex) {
+        // ── CHECKS ────────────────────────────────────────────────────────────
         // Caller may only record retirements for its own nation
         bytes2 expected = registryNation[msg.sender];
         if (expected != record.nationCode) revert WrongNation(expected, record.nationCode);
@@ -149,6 +201,7 @@ contract RetirementVault is AccessControl {
         if (record.tokenId == 0)                       revert InvalidTokenId();
         if (record.nationCode == bytes2(0))            revert InvalidNationCode();
         if (record.retiringEntity == address(0))       revert InvalidEntity();
+        if (record.beneficiaryAddress == address(0))   revert InvalidBeneficiary();
         if (record.retiredAt == 0)                     revert InvalidTimestamp();
         if (bytes(record.purpose).length == 0)         revert PurposeRequired();
         if (bytes(record.serialId).length == 0)        revert SerialRequired();
@@ -156,6 +209,13 @@ contract RetirementVault is AccessControl {
         // Prevent the same (nation, tokenId) pair being recorded twice
         if (_alreadyRecorded[record.nationCode][record.tokenId])
             revert AlreadyRecorded(record.nationCode, record.tokenId);
+
+        // Fee check — validate msg.value before any state changes
+        bool feeActive = retirementFeeWei > 0 && feeRecipient != address(0) && !feeWaived[msg.sender];
+        if (feeActive && msg.value < retirementFeeWei)
+            revert InsufficientRetirementFee(msg.value, retirementFeeWei);
+
+        // ── EFFECTS ───────────────────────────────────────────────────────────
         _alreadyRecorded[record.nationCode][record.tokenId] = true;
 
         ledger.push(record);
@@ -166,16 +226,82 @@ contract RetirementVault is AccessControl {
             retiredByEntity[record.retiringEntity]++;
             retiredByPurpose[record.purposeCode]++;
             retiredByVintage[record.vintageYear]++;
+            retiredByBeneficiary[record.beneficiaryAddress]++;
         }
 
         emit CreditRetiredGlobal(
             record.tokenId,
             record.nationCode,
             record.retiringEntity,
+            record.beneficiaryAddress,
             record.purpose,
             record.complianceRef,
             record.retiredAt
         );
+
+        // ── INTERACTIONS ──────────────────────────────────────────────────────
+        // Forward exact fee to recipient; refund any excess to caller.
+        // Executed last to comply with Checks-Effects-Interactions pattern.
+        if (feeActive) {
+            (bool sent,) = feeRecipient.call{value: retirementFeeWei}("");
+            require(sent, "fee transfer failed");
+            uint256 excess = msg.value - retirementFeeWei;
+            if (excess > 0) {
+                (bool refunded,) = msg.sender.call{value: excess}("");
+                require(refunded, "refund failed");
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  PLATFORM FEE MANAGEMENT — admin only
+    // ─────────────────────────────────────────────────────
+
+    /// @notice Set the per-retirement platform fee in wei.
+    ///         Zero disables fee collection entirely (default — backward compatible).
+    ///         Raise this before a large registry onboarding event; lower it for
+    ///         high-volume public good retirements.
+    ///         When fee > 0, recordRetirement() callers must supply msg.value >= fee.
+    ///         SovereignRegistry.retireCredit() must be updated to forward ETH before
+    ///         activating a non-zero fee (V2 upgrade path).
+    /// @param  feeWei New fee in wei per retirement record.
+    function setRetirementFee(uint256 feeWei) external onlyRole(ADMIN_ROLE) {
+        if (feeWei > MAX_RETIREMENT_FEE_WEI) revert RetirementFeeTooHigh(feeWei, MAX_RETIREMENT_FEE_WEI);
+        uint256 old = retirementFeeWei;
+        retirementFeeWei = feeWei;
+        emit RetirementFeeUpdated(old, feeWei);
+    }
+
+    /// @notice Set the address that receives platform fees.
+    ///         Pass address(0) to suspend fee collection without zeroing the rate.
+    /// @param  recipient New fee recipient.
+    function setFeeRecipient(address recipient) external onlyRole(ADMIN_ROLE) {
+        address old = feeRecipient;
+        feeRecipient = recipient;
+        emit FeeRecipientUpdated(old, recipient);
+    }
+
+    /// @notice Grant or revoke a fee waiver for a specific registry.
+    ///         Waived registries call recordRetirement() for free even when the global
+    ///         fee is non-zero. Use for founding-partner agreements; revoke when the
+    ///         waiver period expires with a single admin transaction.
+    /// @param  registry Address of the SovereignRegistry to waive.
+    /// @param  waived   True to grant waiver, false to revoke.
+    function setFeeWaiver(address registry, bool waived) external onlyRole(ADMIN_ROLE) {
+        feeWaived[registry] = waived;
+        emit FeeWaiverUpdated(registry, waived);
+    }
+
+    /// @notice Withdraw any ETH accidentally sent directly to this contract
+    ///         (fee forwarding failures, direct transfers, etc.).
+    /// @param  to Destination address — must be non-zero.
+    function withdrawFees(address payable to) external onlyRole(ADMIN_ROLE) {
+        if (to == address(0)) revert InvalidRecipient();
+        uint256 balance = address(this).balance;
+        if (balance == 0) return;
+        (bool sent,) = to.call{value: balance}("");
+        require(sent, "withdraw failed");
+        emit FeesWithdrawn(to, balance);
     }
 
     // ─────────────────────────────────────────────────────

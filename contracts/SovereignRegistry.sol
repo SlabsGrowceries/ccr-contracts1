@@ -3,7 +3,9 @@ pragma solidity ^0.8.24;
 
 import "./CRSToken.sol";
 import "./MRVOracle.sol";
+import "./MethodologyRegistry.sol";
 import "./RetirementVault.sol";
+import "./IAllowlist.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
@@ -52,6 +54,7 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
     error NotSuspendable(uint256 tokenId);
     /// @param tokenId Token that is not in SUSPENDED status
     error NotSuspended(uint256 tokenId);
+    error UnapprovedMethodology(string methodology);
     error ProposalPending();
     error NoPendingUpdate();
     /// @param validAfter Timestamp after which the timelock expires
@@ -60,6 +63,17 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
     error NotListable(uint256 tokenId);
     /// @param tokenId Token that is not in LISTED status
     error NotListed(uint256 tokenId);
+    error EmptyBatch();
+    /// @param size    Number of items supplied in the batch
+    /// @param maximum Maximum allowed by MAX_BATCH_SIZE
+    error BatchTooLarge(uint256 size, uint256 maximum);
+    /// @param account Address blocked by the registry's KYC/AML allowlist
+    error NotAllowlisted(address account);
+    /// Beneficiary address must not be zero (required for Art. 6.2 ITMO accounting)
+    error InvalidBeneficiary();
+    /// @param attempted Tokens requested to mint in this call
+    /// @param cap       Active per-period minting cap
+    error MintingCapExceeded(uint256 attempted, uint256 cap);
 
     // ─────────────────────────────────────────────────────
     //  ROLES
@@ -80,11 +94,21 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
     uint256 public totalRetired;
     uint256 public totalSuspended;
 
-    MRVOracle       public oracle;
-    RetirementVault public vault;  // optional — zero address if vault is on a different chain
+    MRVOracle           public oracle;
+    RetirementVault     public vault;               // optional — zero address if vault is on a different chain
+    MethodologyRegistry public methodologyRegistry; // optional — zero address disables methodology validation
+    IAllowlist          public allowlist;            // optional — zero address disables KYC/AML screening
     string          private _baseTokenURI;
 
-    uint256 public constant TIMELOCK_DELAY = 2 days;
+    uint256 public constant TIMELOCK_DELAY  = 2 days;
+    uint256 public constant MAX_BATCH_SIZE  = 200;
+
+    /// @notice Governable minting budget — prevents runaway issuance from a compromised key.
+    ///         Zero = no cap (permissionless minting within REGISTRY_ADMIN authority).
+    uint256 public mintingCap;
+    uint256 public mintingPeriod = 1 days; // rolling window length; governable
+    uint256 public periodStart;            // start of the current minting window
+    uint256 public periodMinted;           // credits minted since periodStart
 
     // Pending timelocked oracle replacement — validAfter == 0 means no pending update
     address public pendingOracle;
@@ -114,8 +138,13 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
     event VaultUpdateProposed(address indexed newVault, uint64 validAfter);
     event VaultUpdated(address indexed oldVault, address indexed newVault);
     event VaultUpdateCancelled(address indexed cancelledVault);
+    event MethodologyRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+    event AllowlistUpdated(address indexed oldList, address indexed newList);
+    event MintingCapUpdated(uint256 oldCap, uint256 newCap, uint256 period);
     event BaseURIUpdated(string oldURI, string newURI);
     event VaultRecordFailed(uint256 indexed tokenId, bytes2 indexed nationCode);
+    event BatchMinted(uint256[] tokenIds, address indexed mintedBy);
+    event BatchRetired(uint256[] tokenIds, address indexed retiredBy);
     /// @notice Emitted after every state-changing operation so IBC relayers and
     ///         off-chain monitors always have a fresh stats snapshot to consume.
     ///         Anyone may re-emit via broadcastStats() if an event was missed.
@@ -190,11 +219,19 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
         if (credit.tonneCO2e == 0)            revert InvalidTonne();
         if (credit.parcel.areaHectares == 0)  revert InvalidArea();
 
-        // 7. Issuing chain must match this registry's nation
+        // 7. Methodology — validated against on-chain registry if one is configured
+        if (address(methodologyRegistry) != address(0) &&
+            !methodologyRegistry.isApproved(credit.methodology))
+            revert UnapprovedMethodology(credit.methodology);
+
+        // 8. Issuing chain must match this registry's nation
         if (credit.issuingChainId != nationCode)
             revert WrongIssuingChain(nationCode, credit.issuingChainId);
 
-        // 8. Write all state BEFORE _safeMint — prevents reentrancy via onERC721Received (CEI)
+        // 9. Minting rate limit — guards against runaway issuance from a compromised key
+        _checkMintingCap(1);
+
+        // 10. Write all state BEFORE _safeMint — prevents reentrancy via onERC721Received (CEI)
         unchecked { tokenId = ++totalMinted; }
 
         _serialUsed[credit.serialId] = true;
@@ -207,10 +244,74 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
         credits[tokenId].retiredBy      = address(0);
         credits[tokenId].retirementReason = "";
 
-        // 9. External calls last (CEI)
+        // 11. External calls last (CEI)
         _safeMint(msg.sender, tokenId);
 
         emit CreditMinted(tokenId, credit.serialId, credit.projectId, msg.sender);
+        emit NCRIStatsBroadcast(nationCode, totalMinted,
+            totalMinted - totalRetired - totalSuspended,
+            totalRetired, totalSuspended, uint64(block.timestamp));
+    }
+
+    /// @notice Mint multiple CRS carbon credit tokens in a single transaction.
+    /// @dev    Identical validation as mintCredit applied per element.
+    ///         Reverts atomically if any credit fails validation — none are minted.
+    ///         A single NCRIStatsBroadcast is emitted at the end of the batch,
+    ///         reducing relayer overhead for quarterly issuance events.
+    ///         CEI pattern is preserved per iteration: all state writes precede _safeMint.
+    /// @param  creditList  Array of fully populated CarbonCredit structs.
+    /// @dev    Second parameter (oracleProof) is reserved for ZK proof integration in Phase 2.
+    /// @return tokenIds    Array of ERC721 token IDs assigned, in input order.
+    function mintBatch(
+        CarbonCredit[] calldata creditList,
+        bytes calldata /* oracleProof */
+    ) external onlyRole(REGISTRY_ADMIN) whenNotPaused returns (uint256[] memory tokenIds) {
+        uint256 n = creditList.length;
+        if (n == 0)               revert EmptyBatch();
+        if (n > MAX_BATCH_SIZE)   revert BatchTooLarge(n, MAX_BATCH_SIZE);
+        _checkMintingCap(n);
+
+        tokenIds = new uint256[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            CarbonCredit calldata credit = creditList[i];
+
+            if (!oracle.verifyAttestation(credit.attestation, credit.parcel.geojsonHash, ""))
+                revert AttestationNotFinalized();
+            if (bytes(credit.serialId).length == 0)       revert EmptySerial();
+            if (_serialUsed[credit.serialId])              revert DuplicateSerial();
+            if (credit.projectId == bytes32(0))            revert InvalidProjectId();
+            if (credit.monitoringEnd <= credit.monitoringStart) revert InvalidMonitoringPeriod();
+            if (credit.vintageYear < 2020 || credit.vintageYear > 2100)
+                revert InvalidVintageYear(credit.vintageYear);
+            if (credit.tonneCO2e == 0)                    revert InvalidTonne();
+            if (credit.parcel.areaHectares == 0)          revert InvalidArea();
+            if (credit.issuingChainId != nationCode)
+                revert WrongIssuingChain(nationCode, credit.issuingChainId);
+            if (address(methodologyRegistry) != address(0) &&
+                !methodologyRegistry.isApproved(credit.methodology))
+                revert UnapprovedMethodology(credit.methodology);
+
+            uint256 tokenId;
+            unchecked { tokenId = ++totalMinted; }
+            tokenIds[i] = tokenId;
+
+            _serialUsed[credit.serialId] = true;
+            projectTokens[credit.projectId].push(tokenId);
+
+            credits[tokenId]                  = credit;
+            credits[tokenId].status           = TokenStatus.ACTIVE;
+            credits[tokenId].mintedAt         = uint64(block.timestamp);
+            credits[tokenId].retiredAt        = 0;
+            credits[tokenId].retiredBy        = address(0);
+            credits[tokenId].retirementReason = "";
+
+            // External call last per iteration (CEI)
+            _safeMint(msg.sender, tokenId);
+            emit CreditMinted(tokenId, credit.serialId, credit.projectId, msg.sender);
+        }
+
+        emit BatchMinted(tokenIds, msg.sender);
         emit NCRIStatsBroadcast(nationCode, totalMinted,
             totalMinted - totalRetired - totalSuspended,
             totalRetired, totalSuspended, uint64(block.timestamp));
@@ -221,10 +322,10 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
     // ─────────────────────────────────────────────────────
 
     /// @notice Permanently retire a credit — claims the carbon offset.
+    ///         Beneficiary defaults to msg.sender (self-retirement).
+    ///         For Art. 6.2 ITMO transfers and CORSIA offsetting on behalf of a client,
+    ///         use retireForBeneficiary() instead.
     /// @dev    The token is NOT burned; it remains on-chain as immutable proof.
-    ///         Status becomes RETIRED irreversibly. The token can no longer be transferred.
-    ///         If a vault is configured, the retirement is auto-recorded globally.
-    ///         try/catch ensures vault failure never blocks a legitimate retirement.
     /// @param  tokenId     ERC721 token to retire.
     /// @param  reason      Human-readable retirement reason (e.g. "CORSIA Q3 2032").
     /// @param  purposeCode Compliance framework under which this credit is being retired.
@@ -233,14 +334,86 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
         string calldata reason,
         CompliancePurpose purposeCode
     ) external whenNotPaused {
-        if (ownerOf(tokenId) != msg.sender)    revert NotOwner(tokenId);
+        if (bytes(reason).length == 0) revert ReasonRequired();
+        _retire(tokenId, reason, purposeCode, msg.sender, "");
+        emit NCRIStatsBroadcast(nationCode, totalMinted,
+            totalMinted - totalRetired - totalSuspended,
+            totalRetired, totalSuspended, uint64(block.timestamp));
+    }
+
+    /// @notice Retire a credit on behalf of a named beneficiary.
+    ///         Required for UNFCCC Article 6.2 ITMO transfers (bilateral sovereign trades)
+    ///         and CORSIA retirements where the broker (msg.sender) and the offsetting
+    ///         airline / entity (beneficiary) differ.
+    ///         The vault records both the retiring wallet and the beneficiary separately,
+    ///         enabling the host country to apply the correct corresponding adjustment.
+    /// @param  tokenId           ERC721 token to retire.
+    /// @param  reason            Retirement reason (e.g. "Art6.2 NO-CD-2031").
+    /// @param  purposeCode       Compliance framework.
+    /// @param  beneficiary       Address of the final offsetting entity.
+    /// @param  beneficiaryName   Human-readable name of the beneficiary (for compliance reports).
+    function retireForBeneficiary(
+        uint256 tokenId,
+        string calldata reason,
+        CompliancePurpose purposeCode,
+        address beneficiary,
+        string calldata beneficiaryName
+    ) external whenNotPaused {
+        if (bytes(reason).length == 0) revert ReasonRequired();
+        if (beneficiary == address(0)) revert InvalidBeneficiary();
+        _retire(tokenId, reason, purposeCode, beneficiary, beneficiaryName);
+        emit NCRIStatsBroadcast(nationCode, totalMinted,
+            totalMinted - totalRetired - totalSuspended,
+            totalRetired, totalSuspended, uint64(block.timestamp));
+    }
+
+    /// @notice Retire multiple credits in a single transaction.
+    ///         All credits retired on behalf of msg.sender (use retireForBeneficiary for Art. 6.2).
+    /// @param  tokenIds    Array of ERC721 tokens to retire.
+    /// @param  reason      Shared retirement reason applied to all credits.
+    /// @param  purposeCode Shared compliance framework for all credits.
+    function retireBatch(
+        uint256[] calldata tokenIds,
+        string calldata reason,
+        CompliancePurpose purposeCode
+    ) external whenNotPaused {
+        uint256 n = tokenIds.length;
+        if (n == 0)                    revert EmptyBatch();
+        if (n > MAX_BATCH_SIZE)        revert BatchTooLarge(n, MAX_BATCH_SIZE);
+        if (bytes(reason).length == 0) revert ReasonRequired();
+
+        for (uint256 i = 0; i < n; i++) {
+            _retire(tokenIds[i], reason, purposeCode, msg.sender, "");
+        }
+
+        emit BatchRetired(tokenIds, msg.sender);
+        emit NCRIStatsBroadcast(nationCode, totalMinted,
+            totalMinted - totalRetired - totalSuspended,
+            totalRetired, totalSuspended, uint64(block.timestamp));
+    }
+
+    /// @dev Shared retirement logic: validate, write effects, emit, vault record.
+    ///      Extracted to eliminate duplication across retireCredit / retireForBeneficiary /
+    ///      retireBatch. All state changes precede the external vault call (CEI).
+    /// @param tokenId         ERC721 token to retire; must be owned by msg.sender and ACTIVE or LISTED.
+    /// @param reason          Human-readable retirement reason written into the credit and vault record.
+    /// @param purposeCode     Compliance framework enum (VOLUNTARY, CORSIA, ARTICLE_6_2, etc.).
+    /// @param beneficiary     Address of the final offsetting entity; msg.sender for self-retirement.
+    /// @param beneficiaryName Human-readable name of the beneficiary (empty string for self-retirement).
+    function _retire(
+        uint256 tokenId,
+        string memory reason,
+        CompliancePurpose purposeCode,
+        address beneficiary,
+        string memory beneficiaryName
+    ) private {
+        if (ownerOf(tokenId) != msg.sender) revert NotOwner(tokenId);
 
         CarbonCredit storage c = credits[tokenId];
         if (c.status != TokenStatus.ACTIVE && c.status != TokenStatus.LISTED)
             revert NotRetirable(tokenId);
-        if (bytes(reason).length == 0) revert ReasonRequired();
 
-        // Effects first (CEI)
+        // Effects (CEI)
         c.status           = TokenStatus.RETIRED;
         c.retiredAt        = uint64(block.timestamp);
         c.retiredBy        = msg.sender;
@@ -248,33 +421,30 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
         unchecked { totalRetired++; }
 
         emit CreditRetired(tokenId, msg.sender, reason);
-        emit NCRIStatsBroadcast(nationCode, totalMinted,
-            totalMinted - totalRetired - totalSuspended,
-            totalRetired, totalSuspended, uint64(block.timestamp));
 
-        // Auto-record in global vault if configured (external calls last — CEI)
+        // Interaction — vault call after all state changes
         if (address(vault) != address(0)) {
-            RetirementVault.RetirementRecord memory record = RetirementVault.RetirementRecord({
-                tokenId:         tokenId,
-                serialId:        c.serialId,
-                nationCode:      nationCode,
-                retiringEntity:  msg.sender,
-                entityName:      "",
-                purposeCode:     purposeCode,
-                purpose:         reason,
-                complianceRef:   "",
-                vintageYear:     c.vintageYear,
-                retiredAt:       c.retiredAt,
-                attestationHash: keccak256(abi.encodePacked(
-                    c.attestation.satelliteHash,
-                    c.attestation.reportHash
-                ))
-            });
-            try vault.recordRetirement(record) {
+            try vault.recordRetirement(RetirementVault.RetirementRecord({
+                tokenId:            tokenId,
+                serialId:           c.serialId,
+                nationCode:         nationCode,
+                retiringEntity:     msg.sender,
+                entityName:         "",
+                purposeCode:        purposeCode,
+                purpose:            reason,
+                complianceRef:      "",
+                vintageYear:        c.vintageYear,
+                retiredAt:          c.retiredAt,
+                attestationHash:    keccak256(abi.encodePacked(
+                                        c.attestation.satelliteHash,
+                                        c.attestation.reportHash
+                                    )),
+                beneficiaryAddress: beneficiary,
+                beneficiaryName:    beneficiaryName
+            })) {
                 // recorded successfully
             } catch {
                 // Vault unavailable — retirement still succeeds on-chain.
-                // Off-chain monitors must re-submit the record manually.
                 emit VaultRecordFailed(tokenId, nationCode);
             }
         }
@@ -358,6 +528,11 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
             TokenStatus s = credits[tokenId].status;
             if (s == TokenStatus.RETIRED)   revert TransferBlockedRetired(tokenId);
             if (s == TokenStatus.SUSPENDED) revert TransferBlockedSuspended(tokenId);
+            // KYC/AML gate — only active on non-zero allowlist (optional)
+            if (address(allowlist) != address(0)) {
+                if (!allowlist.isAllowed(from)) revert NotAllowlisted(from);
+                if (!allowlist.isAllowed(to))   revert NotAllowlisted(to);
+            }
         }
         return super._update(to, tokenId, auth);
     }
@@ -428,6 +603,71 @@ contract SovereignRegistry is ERC721, AccessControl, Pausable {
         pendingVault = address(0);
         pendingVaultValidAfter = 0;
         emit VaultUpdateCancelled(cancelled);
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  METHODOLOGY REGISTRY — government only
+    // ─────────────────────────────────────────────────────
+
+    /// @notice Point this registry at a MethodologyRegistry for on-chain methodology validation.
+    ///         Pass address(0) to disable validation (all methodology strings accepted).
+    ///         No timelock — this adds a restriction, it does not weaken one.
+    /// @param  newRegistry Address of the MethodologyRegistry contract, or zero to disable.
+    function setMethodologyRegistry(address newRegistry) external onlyRole(REGISTRY_ADMIN) {
+        address old = address(methodologyRegistry);
+        methodologyRegistry = MethodologyRegistry(newRegistry);
+        emit MethodologyRegistrySet(old, newRegistry);
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  KYC / AML ALLOWLIST — government only
+    // ─────────────────────────────────────────────────────
+
+    /// @notice Set the KYC/AML allowlist contract. Pass address(0) to disable screening.
+    ///         When non-zero, every ERC-721 transfer is gated by allowlist.isAllowed()
+    ///         on both sender and receiver — blocks sanctioned entities (OFAC / EU lists).
+    ///         Pluggable: deploy a Chainalysis oracle, a managed whitelist, or any contract
+    ///         implementing IAllowlist.
+    /// @param  newAllowlist Address of the IAllowlist implementation, or zero to disable.
+    function setAllowlist(address newAllowlist) external onlyRole(REGISTRY_ADMIN) {
+        address old = address(allowlist);
+        allowlist = IAllowlist(newAllowlist);
+        emit AllowlistUpdated(old, newAllowlist);
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  MINTING CAP — government only
+    // ─────────────────────────────────────────────────────
+
+    /// @notice Set a per-period minting budget. Prevents runaway issuance from a
+    ///         compromised REGISTRY_ADMIN key and aligns on-chain issuance with
+    ///         quarterly MRV audit cycles.
+    ///         Example: setMintingCap(1_000_000, 90 days) = max 1M credits per quarter.
+    ///         Pass cap=0 to remove the limit entirely.
+    /// @param  cap    Maximum number of credits mintable in each period. 0 = no limit.
+    /// @param  period Rolling window length in seconds. Ignored when cap is 0.
+    function setMintingCap(uint256 cap, uint256 period) external onlyRole(REGISTRY_ADMIN) {
+        uint256 old = mintingCap;
+        mintingCap   = cap;
+        if (cap > 0) {
+            mintingPeriod = period > 0 ? period : 1 days;
+            if (periodStart == 0) periodStart = block.timestamp;
+        }
+        emit MintingCapUpdated(old, cap, mintingPeriod);
+    }
+
+    /// @dev Check and update the rolling minting budget. Resets the window automatically
+    ///      when the current period expires. No-op when mintingCap == 0.
+    /// @param amount Number of credits being minted in this call (1 for mintCredit, n for mintBatch).
+    function _checkMintingCap(uint256 amount) private {
+        if (mintingCap == 0) return;
+        if (block.timestamp >= periodStart + mintingPeriod) {
+            periodStart  = block.timestamp;
+            periodMinted = 0;
+        }
+        uint256 next = periodMinted + amount;
+        if (next > mintingCap) revert MintingCapExceeded(next, mintingCap);
+        periodMinted = next;
     }
 
     // ─────────────────────────────────────────────────────

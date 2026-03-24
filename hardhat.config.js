@@ -18,6 +18,7 @@ module.exports = {
   networks: {
     hardhat: {
       chainId: 1337,
+      blockGasLimit: 200_000_000, // raised for large-batch stress tests (200 credits)
     },
     sepolia: {
       url: `https://eth-sepolia.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY || ""}`,

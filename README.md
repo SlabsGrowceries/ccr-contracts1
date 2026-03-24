@@ -11,22 +11,57 @@
 
 ---
 
-## Why CCR is Different
+## Why Every Other Carbon Platform Is Broken
 
-The carbon credit market is broken. Companies buy PDFs from brokers, trust that a forest exists, and have no way to verify that the same tonne wasn't sold twice. Existing blockchain carbon projects (Toucan, KlimaDAO, Moss) simply bridge existing registry credits onto-chain — they inherit all the same trust problems, they just add a token on top.
+The voluntary carbon market is a $2B market built on trust in PDFs. A company buys a "carbon credit" from a broker, receives a certificate, and posts it to their ESG report. There is no way to verify the forest exists, no way to confirm the tonne wasn't already sold to someone else, and no way to know if the government that issued the credit has since revoked it.
 
-**CCR is built differently.**
+Blockchain carbon projects made this worse, not better:
 
-| | Toucan Protocol | KlimaDAO | Moss.Earth | Regen Network | **CCR** |
-|---|---|---|---|---|---|
-| On-chain MRV verification | ❌ | ❌ | ❌ | Partial | ✅ |
-| Science-gated minting (multi-sig auditors) | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Government-sovereign registry | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Immutable double-spend proof | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Global sovereign index product | ❌ | ❌ | ❌ | ❌ | ✅ |
-| DeFi composable (ERC-20 wrapper) | ✅ | ✅ | ❌ | ❌ | ✅ |
-| EVM compatible | ✅ | ✅ | ✅ | ❌ | ✅ |
-| 0 critical audit findings | ✅ | ❌ | N/A | N/A | ✅ |
+- **Toucan Protocol** bridges Verra VCS credits onto Polygon. The bridge inherits all of Verra's off-chain trust assumptions. Toucan doesn't know if Verra's database was changed after the bridge. The token proves nothing except that someone ran a bridge script.
+- **KlimaDAO** built a treasury on top of Toucan's bridged tokens. Its carbon reserves are as questionable as the underlying Toucan credits — with an additional layer of tokenomics volatility.
+- **Moss.Earth** sells Amazon carbon credits as NFTs with no on-chain verification whatsoever. Purchase, receipt, and retirement all happen off-chain.
+- **Regen Network** built a more credible system with on-chain methodology governance, but still relies on off-chain issuers and has no sovereign government as the registry admin. Their "Eco Credits" are issued by private organizations under community-voted methodologies — not sovereign law.
+- **XRP Ledger (XRPL)** added a carbon marketplace to their built-in DEX. XRPL offers fast settlement, atomic swaps, and zero counter-party risk on trades. But the credits listed on XRPL are bridged from existing off-chain registries (Gold Standard, Verra). XRPL has no MRV oracle, no government registry admin, no immutable retirement ledger, and no double-spend proof. It is a fast exchange for certificates whose authenticity it cannot verify.
+
+**CCR eliminates every one of these failure modes at the protocol level.**
+
+---
+
+## Full Competitive Analysis
+
+| Feature | Toucan | KlimaDAO | Moss.Earth | Regen Network | XRP/XRPL | **CCR** |
+|---|---|---|---|---|---|---|
+| On-chain MRV verification | ❌ | ❌ | ❌ | Partial | ❌ | ✅ |
+| Science-gated minting (multi-sig auditors) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Government-sovereign registry | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Immutable double-spend proof | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Parcel boundary hash binding | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| 2-day admin timelocks | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Nation binding (registry ≠ cross-nation) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Global sovereign index product | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Batch mint + batch retire | Partial | ❌ | ❌ | Partial | ❌ | ✅ |
+| DeFi composable (ERC-20 wrapper) | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ |
+| Monotonicity invariants on stats | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Typed custom errors (gas-efficient reverts) | ❌ | ❌ | ❌ | ❌ | N/A | ✅ |
+| EVM compatible | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 0 critical audit findings | ✅ | ❌ | N/A | N/A | N/A | ✅ |
+
+### Where CCR Outperforms XRP Specifically
+
+XRP/XRPL is the most technically sophisticated competitor. Here is the exact gap:
+
+| Dimension | XRP/XRPL | CCR |
+|---|---|---|
+| Settlement speed | 3–5 seconds | EVM block time (~12s) |
+| Built-in DEX | ✅ native AMM | ✅ via CarbonPool → any AMM |
+| MRV oracle | ❌ none | ✅ 3-of-5 auditor multi-sig |
+| Who mints? | Bridged issuer (private) | Government (sovereign law) |
+| Double-spend prevention | Trust issuer + XRPL ledger | On-chain `_alreadyRecorded` map |
+| Credit authenticity | Off-chain registry trust | Parcel hash bound to auditor sigs |
+| Retirement immutability | XRPL record (deletable by admin) | Append-only vault, structurally impossible to delete |
+| Compliance reporting | Off-chain | `retiredByNation`, `retiredByPurpose`, `retiredByVintage` — queryable on-chain |
+
+XRP wins on raw transaction speed. CCR wins on everything that matters for carbon market integrity.
 
 ---
 
@@ -70,7 +105,7 @@ The carbon credit market is broken. Companies buy PDFs from brokers, trust that 
 | Contract | Description |
 |---|---|
 | `MRVOracle.sol` | 3-of-5 auditor threshold multi-sig. Timelocked threshold changes. Parcel hash integrity. |
-| `SovereignRegistry.sol` | ERC-721 carbon credit registry. Government-controlled minting. 2-day timelocks on all admin ops. |
+| `SovereignRegistry.sol` | ERC-721 carbon credit registry. Government-controlled minting. Batch mint/retire. 2-day timelocks. |
 | `RetirementVault.sol` | Append-only global retirement ledger. Nation binding. CompliancePurpose enum. |
 | `NCRIIndex.sol` | Sovereign carbon basket index. Monotonicity invariants. Dust-free rebalancing. |
 | `CarbonPool.sol` | ERC-20 fungible wrapper. O(1) swap-and-pop queue. Vintage year filter. |
@@ -89,7 +124,7 @@ CCR holds `OPERATOR` only — infrastructure access, nothing more.
 registry.revokeRole(OPERATOR, ccrAddress);
 ```
 
-No other carbon credit platform on any blockchain gives a sovereign government this level of control.
+This is the feature no other carbon platform offers. Toucan's bridge is controlled by Toucan. Regen's issuers are private organizations. XRP's marketplace is permissioned by Ripple Labs. In CCR, the sovereign government is the root of trust, and the code enforces it.
 
 ---
 
@@ -105,10 +140,27 @@ No other carbon credit platform on any blockchain gives a sovereign government t
 - **Immutable retirement** — `RetirementVault` is append-only; double-counting is structurally impossible
 - **Nation binding** — a registry authorised for Liberia cannot record a DRC retirement
 - **Monotonicity invariants** — NCRIIndex rejects any relayer update that decreases historical minted or retired counts
-- **CEI pattern** throughout — no reentrancy vectors
+- **CEI pattern** throughout — no reentrancy vectors, including inside `mintBatch` and `retireBatch` loops
+- **Atomic batch operations** — a batch reverts entirely if any single credit fails validation; no partial state
 - **Typed custom errors** — full parameterised error taxonomy across all 5 contracts
 
 Full threat model, access control matrix, and invariants: [SECURITY.md](./SECURITY.md)
+
+---
+
+## Batch Operations
+
+CCR supports institutional-scale operations that single-credit protocols cannot match:
+
+```solidity
+// Government mints 50 credits from one quarterly audit in a single transaction
+uint256[] memory ids = registry.mintBatch(credits, "");
+
+// Institutional buyer retires their entire CORSIA portfolio at once
+registry.retireBatch(tokenIds, "CORSIA Q3 2032", CompliancePurpose.CORSIA);
+```
+
+This closes the gap with XRP/Toucan/Regen for high-throughput use cases while maintaining per-credit MRV validation and atomic rollback on any failure.
 
 ---
 
@@ -141,7 +193,7 @@ Requires Node.js v22+. Copy `.env.example` to `.env` and add your keys.
 ## Test Coverage
 
 ```
-127 passing (2s)
+127 passing (3s)
 ```
 
 | Area | Tests |

@@ -36,6 +36,16 @@ contract NCRIIndex is AccessControl {
     /// @param active  Supplied totalActive value
     /// @param minted  Supplied totalMinted value
     error ActiveExceedsMinted(uint256 active, uint256 minted);
+    /// @param current  Value currently stored
+    /// @param provided Value the relayer attempted to set
+    /// @param maxJump  Maximum single-update increase allowed
+    error StatJumpTooLarge(uint256 current, uint256 provided, uint256 maxJump);
+    error InvalidStatJump();
+    /// @param active    Supplied totalActive value
+    /// @param retired   Supplied totalRetired value
+    /// @param suspended Supplied totalSuspended value
+    /// @param minted    Supplied totalMinted value
+    error StatsInconsistent(uint256 active, uint256 retired, uint256 suspended, uint256 minted);
 
     // ─────────────────────────────────────────────────────
     //  ROLES
@@ -44,6 +54,14 @@ contract NCRIIndex is AccessControl {
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 public constant RELAYER_ROLE    = keccak256("RELAYER_ROLE");
     bytes32 public constant ADMIN_ROLE      = keccak256("ADMIN_ROLE");
+
+    /// @notice Default cap on the increase in totalMinted or totalRetired allowed per sync.
+    uint256 public constant DEFAULT_STAT_JUMP = 10_000_000;
+
+    /// @notice Governable cap. GOVERNANCE_ROLE can raise this before onboarding a large
+    ///         nation whose initial sync would exceed the default limit.
+    ///         Prevents a compromised relayer from injecting astronomically wrong values.
+    uint256 public maxStatJump = DEFAULT_STAT_JUMP;
 
     // ─────────────────────────────────────────────────────
     //  NATION SLOT
@@ -81,6 +99,7 @@ contract NCRIIndex is AccessControl {
     event NationDeactivated(bytes2 indexed nationCode);
     event NationReactivated(bytes2 indexed nationCode);
     event NationStatsUpdated(bytes2 indexed nationCode, uint256 totalActive, uint256 totalRetired);
+    event MaxStatJumpUpdated(uint256 oldMax, uint256 newMax);
 
     // ─────────────────────────────────────────────────────
     //  CONSTRUCTOR
@@ -190,6 +209,16 @@ contract NCRIIndex is AccessControl {
         if (_totalMinted  < n.totalMinted)  revert MintedMustNotDecrease(n.totalMinted,  _totalMinted);
         if (_totalRetired < n.totalRetired) revert RetiredMustNotDecrease(n.totalRetired, _totalRetired);
         if (_totalActive  > _totalMinted)   revert ActiveExceedsMinted(_totalActive,       _totalMinted);
+        // Enforce the ledger identity: active + retired + suspended == minted.
+        // SovereignRegistry always emits NCRIStatsBroadcast with totalActive = totalMinted -
+        // totalRetired - totalSuspended, so this must hold for any honestly relayed data.
+        // Rejects a buggy or compromised relayer submitting internally inconsistent stats.
+        if (_totalActive + _totalRetired + _totalSuspended != _totalMinted)
+            revert StatsInconsistent(_totalActive, _totalRetired, _totalSuspended, _totalMinted);
+        if (_totalMinted  - n.totalMinted  > maxStatJump)
+            revert StatJumpTooLarge(n.totalMinted,  _totalMinted,  maxStatJump);
+        if (_totalRetired - n.totalRetired > maxStatJump)
+            revert StatJumpTooLarge(n.totalRetired, _totalRetired, maxStatJump);
 
         if (n.isActive) {
             globalActiveSupply  = globalActiveSupply  - n.totalActive  + _totalActive;
@@ -273,6 +302,16 @@ contract NCRIIndex is AccessControl {
     // ─────────────────────────────────────────────────────
     //  RELAYER MANAGEMENT
     // ─────────────────────────────────────────────────────
+
+    /// @notice Update the per-sync stat jump cap. Raise before onboarding a large nation
+    ///         whose initial batch would legitimately exceed the current limit.
+    /// @param  newMax New maximum increase per sync call; must be > 0.
+    function setMaxStatJump(uint256 newMax) external onlyRole(GOVERNANCE_ROLE) {
+        if (newMax == 0) revert InvalidStatJump();
+        uint256 old = maxStatJump;
+        maxStatJump = newMax;
+        emit MaxStatJumpUpdated(old, newMax);
+    }
 
     /// @notice Grant RELAYER_ROLE to an IBC relayer address.
     function addRelayer(address relayer) external onlyRole(ADMIN_ROLE) {

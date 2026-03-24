@@ -32,6 +32,8 @@ contract MRVOracle is AccessControl {
     error HashMismatch(bytes32 existing, bytes32 submitted);
     error AttestationAlreadyFinalized(bytes32 attestationId);
     error AlreadySigned(bytes32 attestationId, address auditor);
+    /// @param attestationId ID of the attestation that was not found
+    error AttestationNotFound(bytes32 attestationId);
 
     // ─────────────────────────────────────────────────────
     //  ROLES & CONSTANTS
@@ -84,6 +86,7 @@ contract MRVOracle is AccessControl {
     event ThresholdProposed(uint8 indexed newThreshold, uint64 validAfter);
     event ThresholdExecuted(uint8 oldThreshold, uint8 newThreshold);
     event ThresholdUpdateCancelled(uint8 indexed cancelledThreshold);
+    event AttestationReset(bytes32 indexed attestationId, uint8 signersCleared);
 
     // ─────────────────────────────────────────────────────
     //  CONSTRUCTOR
@@ -217,6 +220,32 @@ contract MRVOracle is AccessControl {
             a.timestamp  = uint64(block.timestamp);
             emit AttestationFinalized(attestationId, count);
         }
+    }
+
+    /// @notice Reset a poisoned or incorrectly started attestation so auditors can start fresh.
+    /// @dev    Only callable on UNFINALIZED attestations — a finalized attestation is permanent.
+    ///         Use case: auditor #1 submits a wrong parcel hash, locking all other auditors out
+    ///         with HashMismatch. Admin resets the attestation; auditors resubmit correctly.
+    ///         All signer status flags are cleared to prevent double-count on resubmission.
+    ///         Uses ADMIN_ROLE (same as auditor management) — not DEFAULT_ADMIN_ROLE, which is
+    ///         reserved for role management and should not double as an operations key.
+    /// @param  attestationId The ID of the attestation to reset.
+    function resetAttestation(bytes32 attestationId) external onlyRole(ADMIN_ROLE) {
+        Attestation storage a = attestations[attestationId];
+        if (a.compositeHash == bytes32(0))  revert AttestationNotFound(attestationId);
+        if (a.finalized)                    revert AttestationAlreadyFinalized(attestationId);
+
+        // Clean up per-signer status to prevent stale flags on resubmission
+        address[] memory signers = a.signers;
+        uint8 cleared = uint8(signers.length);
+        unchecked {
+            for (uint256 i = 0; i < signers.length; i++) {
+                delete _signerStatus[attestationId][signers[i]];
+            }
+        }
+
+        delete attestations[attestationId];
+        emit AttestationReset(attestationId, cleared);
     }
 
     // ─────────────────────────────────────────────────────
